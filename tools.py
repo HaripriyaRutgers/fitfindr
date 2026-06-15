@@ -12,6 +12,8 @@ Tools:
     create_fit_card(outfit, new_item)               → str
 """
 
+from __future__ import annotations
+
 import os
 
 from dotenv import load_dotenv
@@ -24,6 +26,9 @@ load_dotenv()
 
 # ── Groq client ───────────────────────────────────────────────────────────────
 
+MODEL = "llama-3.3-70b-versatile"
+
+
 def _get_groq_client():
     """Initialize and return a Groq client using GROQ_API_KEY from .env."""
     api_key = os.environ.get("GROQ_API_KEY")
@@ -32,6 +37,20 @@ def _get_groq_client():
             "GROQ_API_KEY not set. Add it to a .env file in the project root."
         )
     return Groq(api_key=api_key)
+
+
+def _chat(system_prompt: str, user_prompt: str, temperature: float = 0.7) -> str:
+    """Send a single system+user message to the LLM and return its text reply."""
+    client = _get_groq_client()
+    response = client.chat.completions.create(
+        model=MODEL,
+        temperature=temperature,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    return response.choices[0].message.content.strip()
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
@@ -69,8 +88,38 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+
+    # Tokenize the description into lowercase keywords (e.g. "vintage graphic tee").
+    keywords = [w for w in description.lower().split() if w]
+
+    matches = []
+    for item in listings:
+        # 1. Price filter (skip if max_price is None).
+        if max_price is not None and item["price"] > max_price:
+            continue
+
+        # 2. Size filter (skip if size is None). Case-insensitive substring,
+        #    so "M" matches "S/M", "M/L", etc.
+        if size is not None and size.lower() not in item["size"].lower():
+            continue
+
+        # 3. Score by how many keywords appear in the item's searchable text.
+        searchable = " ".join([
+            item["title"],
+            item["description"],
+            item["category"],
+            " ".join(item["style_tags"]),
+        ]).lower()
+        score = sum(1 for kw in keywords if kw in searchable)
+
+        # 4. Drop items with no keyword overlap.
+        if score > 0:
+            matches.append((score, item))
+
+    # 5. Sort by score, highest first, and return just the listing dicts.
+    matches.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in matches]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +149,40 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    items = wardrobe.get("items", [])
+
+    # Failure mode: empty wardrobe — give a helpful message, don't call the LLM.
+    if not items:
+        return "Your wardrobe is empty — try adding some items first!"
+
+    # Listings use "title"; wardrobe items use "name". Fall back between them.
+    item_name = new_item.get("name") or new_item.get("title", "this item")
+    item_desc = new_item.get("description", "")
+
+    # Format the wardrobe into a readable bulleted list for the prompt.
+    wardrobe_lines = []
+    for w in items:
+        colors = ", ".join(w.get("colors", []))
+        tags = ", ".join(w.get("style_tags", []))
+        wardrobe_lines.append(
+            f"- {w['name']} ({w['category']}; colors: {colors}; style: {tags})"
+        )
+    wardrobe_text = "\n".join(wardrobe_lines)
+
+    system_prompt = (
+        "You are a friendly, knowledgeable fashion stylist. You suggest "
+        "practical, good-looking outfits using items the user already owns."
+    )
+    user_prompt = (
+        f"New item the user is considering:\n"
+        f"{item_name} — {item_desc}\n\n"
+        f"The user's current wardrobe:\n{wardrobe_text}\n\n"
+        f"Suggest 1-2 complete outfits that pair the new item with specific "
+        f"pieces from the wardrobe. Call the wardrobe pieces out by name and "
+        f"keep it casual and concise."
+    )
+
+    return _chat(system_prompt, user_prompt, temperature=0.7)
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +214,27 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # Failure mode: no outfit text — return a clear error, don't call the LLM.
+    if outfit is None or not outfit.strip():
+        return "Cannot create a fit card without an outfit description."
+
+    item_name = new_item.get("name") or new_item.get("title", "this piece")
+    price = new_item.get("price")
+    platform = new_item.get("platform", "")
+
+    system_prompt = (
+        "You are a fashion copywriter who writes short, aesthetic, "
+        "Instagram-style outfit captions. Keep it under 100 words, casual and "
+        "authentic — like a real OOTD post, not a product description."
+    )
+    user_prompt = (
+        f"Write a caption for this thrifted look.\n"
+        f"Item: {item_name}"
+        + (f" (${price})" if price is not None else "")
+        + (f" from {platform}" if platform else "")
+        + f"\nOutfit: {outfit}\n\n"
+        f"Mention the item name, price, and platform naturally (once each)."
+    )
+
+    # Higher temperature so captions vary across runs.
+    return _chat(system_prompt, user_prompt, temperature=0.9)
